@@ -91,7 +91,35 @@ Environment variables (all have local defaults):
 | `ADMIN_TOKEN` | api, web | `dev-admin-token` (must match in both) |
 | `ADMIN_USER` / `ADMIN_PASSWORD` | web | `admin` / `change-me` |
 | `API_URL` | web | `http://localhost:8000` |
-| `SMTP_HOST` / `SMTP_PORT` / `MAIL_FROM` | worker | unset = emails are logged, not sent |
+| `SMTP_HOST` / `SMTP_PORT` / `SMTP_USER` / `SMTP_PASSWORD` / `MAIL_FROM` | worker | unset host = emails are logged, not sent; Docker defaults to Mailpit |
+
+## Sending real email
+
+By default every email goes to **Mailpit** (http://localhost:8025), a development inbox that
+catches mail so nothing leaves your machine. To deliver to real inboxes, point the worker at a
+real SMTP account. Example with Gmail:
+
+1. Turn on 2-Step Verification for the Gmail account, then create an **App Password**
+   at https://myaccount.google.com/apppasswords (a normal Gmail password will not work).
+2. Copy `.env.example` to `.env` and uncomment/fill the Gmail lines:
+
+   ```
+   SMTP_HOST=smtp.gmail.com
+   SMTP_PORT=465
+   SMTP_USER=your.address@gmail.com
+   SMTP_PASSWORD=your-16-character-app-password
+   MAIL_FROM="Your Event Name <your.address@gmail.com>"
+   ```
+3. Restart the worker: `docker compose up -d --force-recreate worker`
+4. Check it connected: `docker compose logs worker --tail 20` should show
+   `[mail] connected to smtp.gmail.com:465 (real SMTP as ...)`. A wrong setting shows
+   `[mail] CANNOT use ...` with the reason.
+
+Keep `MAIL_FROM` the same address as `SMTP_USER`; Gmail rewrites other senders, and mail
+"from" a domain you do not own (like the default `example.org`) is rejected or goes to spam.
+Gmail limits sending to roughly 500 emails a day, which is plenty for this event. For a
+branded sender address use a transactional provider (Brevo, Mailgun, SendGrid, Amazon SES)
+with the same `SMTP_*` variables.
 
 ## Tests
 

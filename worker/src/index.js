@@ -2,7 +2,7 @@ import { Worker } from 'bullmq';
 import { processAllocation } from './allocation.js';
 import { ALLOCATION_QUEUE, NOTIFICATION_QUEUE } from './config.js';
 import { pool } from './db.js';
-import { processNotification } from './notifications.js';
+import { processNotification, verifyMail } from './notifications.js';
 import { connection } from './queues.js';
 
 // concurrency 1 = assignments are applied strictly one at a time
@@ -14,6 +14,7 @@ for (const w of [allocation, notifications]) {
   w.on('error', (err) => console.error(`[${w.name}] worker error:`, err.message));
 }
 console.log('Workers running: allocation (concurrency 1), notifications (concurrency 5)');
+verifyMail();
 
 async function shutdown() {
   await Promise.all([allocation.close(), notifications.close()]);

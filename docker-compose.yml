@@ -43,9 +43,12 @@ services:
     environment:
       DATABASE_URL: postgresql://slotcrm:slotcrm@postgres:5432/slotcrm
       REDIS_URL: redis://redis:6379
-      SMTP_HOST: mailpit
-      SMTP_PORT: "1025"
-      MAIL_FROM: "Event Bookings <bookings@example.org>"
+      # defaults send to the Mailpit catcher; set these in a .env file for real email (see .env.example)
+      SMTP_HOST: ${SMTP_HOST:-mailpit}
+      SMTP_PORT: ${SMTP_PORT:-1025}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      MAIL_FROM: "${MAIL_FROM:-Event Bookings <bookings@example.org>}"
     depends_on:
       postgres: {condition: service_healthy}
       redis: {condition: service_healthy}

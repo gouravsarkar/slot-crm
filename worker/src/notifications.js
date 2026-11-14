@@ -1,10 +1,31 @@
 import nodemailer from 'nodemailer';
-import { MAIL_FROM, SMTP_HOST, SMTP_PORT } from './config.js';
+import { MAIL_FROM, SMTP_HOST, SMTP_PASSWORD, SMTP_PORT, SMTP_SECURE, SMTP_USER } from './config.js';
 import { pool } from './db.js';
 
-const transport = SMTP_HOST
-  ? nodemailer.createTransport({ host: SMTP_HOST, port: SMTP_PORT, secure: false, ignoreTLS: true })
-  : nodemailer.createTransport({ jsonTransport: true }); // no SMTP configured: log instead of send
+/** Nodemailer options for the three modes: no SMTP (log only), real provider, local Mailpit. */
+export function transportOptions({ host, port, secure, user, password }) {
+  if (!host) return { jsonTransport: true }; // no SMTP configured: log instead of send
+  if (user) {
+    // real provider: login + encryption (implicit TLS on 465, STARTTLS required otherwise)
+    return { host, port, secure, requireTLS: !secure, auth: { user, pass: password } };
+  }
+  return { host, port, secure: false, ignoreTLS: true }; // local dev catcher (Mailpit)
+}
+
+const transport = nodemailer.createTransport(
+  transportOptions({ host: SMTP_HOST, port: SMTP_PORT, secure: SMTP_SECURE, user: SMTP_USER, password: SMTP_PASSWORD }));
+
+/** Logs once at startup whether the mail settings work, so mistakes show up immediately. */
+export async function verifyMail() {
+  if (!SMTP_HOST) return console.log('[mail] SMTP_HOST not set: emails are logged, not sent');
+  const mode = SMTP_USER ? `real SMTP as ${SMTP_USER}` : 'local catcher (no login)';
+  try {
+    await transport.verify();
+    console.log(`[mail] connected to ${SMTP_HOST}:${SMTP_PORT} (${mode})`);
+  } catch (err) {
+    console.error(`[mail] CANNOT use ${SMTP_HOST}:${SMTP_PORT} (${mode}): ${err.message}`);
+  }
+}
 
 const fmtDate = (d) =>
   new Date(`${d}T00:00:00Z`).toLocaleDateString('en-GB', {
