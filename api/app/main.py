@@ -1,15 +1,14 @@
 import datetime as dt
 import logging
-import secrets
 import uuid
 from contextlib import asynccontextmanager
 
 import psycopg.errors as pgerr
-from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Query
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query
 from psycopg.types.json import Jsonb
 
-from . import db
-from .config import ADMIN_TOKEN
+from . import auth, db, portal
+from .booking import save_request
 from .queues import close_queues, enqueue_allocation, enqueue_notification
 from .schemas import (AssignJobIn, DayIn, DayPatch, EventIn, RequestIn,
                       RequestPatch, SuggestJobIn, UnassignJobIn)
@@ -20,6 +19,7 @@ log = logging.getLogger("api")
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     await db.open_pool()
+    await auth.ensure_first_admin()
     yield
     await close_queues()
     await db.close_pool()
@@ -28,13 +28,9 @@ async def lifespan(_: FastAPI):
 app = FastAPI(title="Slot booking CRM", lifespan=lifespan)
 
 
-def require_admin(x_admin_token: str | None = Header(default=None)) -> None:
-    if not x_admin_token or not secrets.compare_digest(x_admin_token, ADMIN_TOKEN):
-        raise HTTPException(status_code=401, detail="Admin token required")
-
-
 public = APIRouter(prefix="/api")
-admin = APIRouter(prefix="/api/admin", dependencies=[Depends(require_admin)])
+# Every admin route requires a logged-in session (see auth.py)
+admin = APIRouter(prefix="/api/admin", dependencies=[Depends(auth.current_admin)])
 
 
 async def fetch_all(conn, sql: str, params=None) -> list[dict]:
@@ -89,37 +85,7 @@ async def event_slots(event_id: int, conn=Depends(db.get_conn)):
 
 @public.post("/requests", status_code=201)
 async def create_request(body: RequestIn, conn=Depends(db.get_conn)):
-    if not await fetch_one(conn, "SELECT 1 AS x FROM events WHERE id=%s", (body.event_id,)):
-        raise HTTPException(404, "Event not found")
-
-    pref_ids = sorted({sid for act in body.acts for sid in act.preferred_slot_ids})
-    if pref_ids:
-        valid = await fetch_one(conn, """
-            SELECT count(*) AS n FROM slots s JOIN event_days d ON d.id = s.event_day_id
-            WHERE s.id = ANY(%s) AND d.event_id = %s""", (pref_ids, body.event_id))
-        if valid["n"] != len(pref_ids):
-            raise HTTPException(422, "Some preferred segments do not belong to this event")
-
-    group = await fetch_one(conn, """
-        INSERT INTO groups (name, contact_name, email, phone) VALUES (%s, %s, %s, %s)
-        ON CONFLICT (lower(email), lower(name))
-        DO UPDATE SET contact_name = EXCLUDED.contact_name,
-                      phone = COALESCE(EXCLUDED.phone, groups.phone)
-        RETURNING id""", (body.group_name, body.contact_name, body.email, body.phone))
-    req = await fetch_one(conn, """
-        INSERT INTO slot_requests (event_id, group_id, group_notes) VALUES (%s, %s, %s) RETURNING id""",
-                          (body.event_id, group["id"], body.group_notes))
-    act_ids = []
-    for act in body.acts:
-        row = await fetch_one(conn, """
-            INSERT INTO acts (request_id, name, segments_requested, notes) VALUES (%s, %s, %s, %s) RETURNING id""",
-                              (req["id"], act.name, act.segments_requested, act.notes))
-        act_ids.append(row["id"])
-        for sid in sorted(set(act.preferred_slot_ids)):
-            await conn.execute("INSERT INTO act_preferences (act_id, slot_id) VALUES (%s, %s)", (row["id"], sid))
-    await conn.commit()  # worker must see the rows before it is notified
-    await enqueue_notification("request_received", {"request_id": req["id"]})
-    return {"request_id": req["id"], "act_ids": act_ids}
+    return await save_request(conn, body)
 
 
 # ---------------------------------------------------------------- admin
@@ -225,7 +191,8 @@ async def create_job(conn, kind: str, request_id: int, payload: dict, requested_
 
 
 @admin.post("/requests/{request_id}/assign", status_code=202)
-async def queue_assign(request_id: int, body: AssignJobIn, conn=Depends(db.get_conn)):
+async def queue_assign(request_id: int, body: AssignJobIn, conn=Depends(db.get_conn),
+                       user=Depends(auth.current_admin)):
     if body.request_id != request_id:
         raise HTTPException(422, "request_id mismatch")
     act_ids = [a.act_id for a in body.assignments]
@@ -242,26 +209,28 @@ async def queue_assign(request_id: int, body: AssignJobIn, conn=Depends(db.get_c
                          (slot_ids, request_id))
     if ok["n"] != len(set(slot_ids)) or len(set(slot_ids)) != len(slot_ids):
         raise HTTPException(422, "Invalid or duplicate segments for this event")
-    payload = {"request_id": request_id, "assigned_by": body.requested_by,
+    payload = {"request_id": request_id, "assigned_by": user["email"],
                "assignments": [a.model_dump() for a in body.assignments]}
-    return {"job_id": await create_job(conn, "assign", request_id, payload, body.requested_by)}
+    return {"job_id": await create_job(conn, "assign", request_id, payload, user["email"])}
 
 
 @admin.post("/requests/{request_id}/unassign", status_code=202)
-async def queue_unassign(request_id: int, body: UnassignJobIn, conn=Depends(db.get_conn)):
+async def queue_unassign(request_id: int, body: UnassignJobIn, conn=Depends(db.get_conn),
+                         user=Depends(auth.current_admin)):
     ok = await fetch_one(conn, "SELECT count(*) AS n FROM acts WHERE id = ANY(%s) AND request_id = %s",
                          (body.act_ids, request_id))
     if ok["n"] != len(set(body.act_ids)):
         raise HTTPException(422, "Acts do not belong to this request")
     payload = {"request_id": request_id, "act_ids": body.act_ids}
-    return {"job_id": await create_job(conn, "unassign", request_id, payload, body.requested_by)}
+    return {"job_id": await create_job(conn, "unassign", request_id, payload, user["email"])}
 
 
 @admin.post("/requests/{request_id}/suggest", status_code=202)
-async def queue_suggest(request_id: int, body: SuggestJobIn, conn=Depends(db.get_conn)):
+async def queue_suggest(request_id: int, body: SuggestJobIn, conn=Depends(db.get_conn),
+                        user=Depends(auth.current_admin)):
     if not await fetch_one(conn, "SELECT 1 AS x FROM slot_requests WHERE id=%s", (request_id,)):
         raise HTTPException(404, "Request not found")
-    return {"job_id": await create_job(conn, "suggest", request_id, {"request_id": request_id}, body.requested_by)}
+    return {"job_id": await create_job(conn, "suggest", request_id, {"request_id": request_id}, user["email"])}
 
 
 @admin.get("/jobs/{job_id}")
@@ -344,5 +313,7 @@ async def delete_day(day_id: int, conn=Depends(db.get_conn)):
     await conn.commit()
 
 
+app.include_router(auth.router)
 app.include_router(public)
+app.include_router(portal.router)
 app.include_router(admin)

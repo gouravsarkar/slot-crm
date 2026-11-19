@@ -1,18 +1,25 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { API_URL, SESSION_COOKIE, sessionCookieHeader } from '@/lib/session';
 
-// HTTP Basic auth in front of the admin UI and the admin API proxy.
-export function middleware(req: NextRequest) {
-  const user = process.env.ADMIN_USER ?? 'admin';
-  const pass = process.env.ADMIN_PASSWORD ?? 'change-me';
-  const header = req.headers.get('authorization') ?? '';
-  if (header.startsWith('Basic ')) {
-    const [u, ...rest] = atob(header.slice(6)).split(':');
-    if (u === user && rest.join(':') === pass) return NextResponse.next();
+// Admin pages need a valid session cookie; it is checked against the API (Postgres).
+// The /api/admin/* proxy is not listed here: FastAPI checks the session on every admin call.
+export async function middleware(req: NextRequest) {
+  const token = req.cookies.get(SESSION_COOKIE)?.value;
+  if (token) {
+    try {
+      const res = await fetch(`${API_URL}/api/auth/me`, { headers: sessionCookieHeader(req), cache: 'no-store' });
+      if (res.ok) return NextResponse.next();
+      if (res.status !== 401) return new NextResponse('Login service error', { status: 503 });
+    } catch {
+      return new NextResponse('Login service unavailable', { status: 503 });
+    }
   }
-  return new NextResponse('Authentication required', {
-    status: 401,
-    headers: { 'WWW-Authenticate': 'Basic realm="Slot CRM admin"' },
-  });
+  const url = req.nextUrl.clone();
+  url.pathname = '/login';
+  url.search = `?next=${encodeURIComponent(req.nextUrl.pathname + req.nextUrl.search)}`;
+  const res = NextResponse.redirect(url);
+  if (token) res.cookies.delete(SESSION_COOKIE); // expired or revoked
+  return res;
 }
 
-export const config = { matcher: ['/admin/:path*', '/api/admin/:path*'] };
+export const config = { matcher: ['/admin/:path*'] };

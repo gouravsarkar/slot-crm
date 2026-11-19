@@ -19,6 +19,11 @@ export async function api<T>(path: string, init?: RequestInit): Promise<T> {
     headers: { 'content-type': 'application/json', ...(init?.headers ?? {}) },
     cache: 'no-store',
   });
+  if (res.status === 401 && path.startsWith('/api/admin/') && typeof window !== 'undefined') {
+    // session expired: back to the login page, then return here
+    window.location.href = `/login?next=${encodeURIComponent(window.location.pathname + window.location.search)}`;
+    throw new Error('Login required');
+  }
   if (!res.ok) {
     let message = res.statusText;
     try {
@@ -54,3 +59,9 @@ export function addMinutes(t: string, mins: number): string {
 }
 
 export const fmtDay = (d: Day) => `${d.label ?? ''} ${d.event_date}`.trim();
+
+/** "1 segment", "3 segments" */
+export const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? '' : 's'}`;
+
+/** "under_review" -> "Under review", "paid" -> "Paid" */
+export const statusLabel = (s: string) => { const t = s.replace(/_/g, ' '); return t.charAt(0).toUpperCase() + t.slice(1); };

@@ -1,6 +1,6 @@
 """End-to-end test against a running stack (API + Postgres + Redis + Node worker).
 
-    API_URL=http://localhost:8000 ADMIN_TOKEN=dev-admin-token pytest -q api/tests
+    API_URL=http://localhost:8000 ADMIN_EMAIL=admin@example.org ADMIN_PASSWORD=change-me-now pytest -q api/tests
 """
 import os
 import time
@@ -9,14 +9,31 @@ import httpx
 import pytest
 
 API = os.environ.get("API_URL", "http://localhost:8000")
-H = {"X-Admin-Token": os.environ.get("ADMIN_TOKEN", "dev-admin-token")}
+EMAIL = os.environ.get("ADMIN_EMAIL", "admin@example.org")
+PASSWORD = os.environ.get("ADMIN_PASSWORD", "change-me-now")
 
 try:
     httpx.get(f"{API}/health", timeout=2).raise_for_status()
 except Exception:  # noqa: BLE001
     pytest.skip("stack not running", allow_module_level=True)
 
-c = httpx.Client(base_url=API, timeout=10)
+COOKIE = "slotcrm_session"
+
+
+def login(client: httpx.Client, email: str = EMAIL, password: str = PASSWORD) -> httpx.Response:
+    """The session arrives as a cookie and is kept in the client's cookie jar."""
+    return client.post("/api/auth/login", json={"email": email, "password": password})
+
+
+def client_with(token: str) -> httpx.Client:
+    return httpx.Client(base_url=API, timeout=10, cookies={COOKIE: token})
+
+
+anon = httpx.Client(base_url=API, timeout=10)   # never logged in
+c = httpx.Client(base_url=API, timeout=10)      # logged-in admin (session cookie in its jar)
+_r = login(c)
+assert _r.status_code == 200, f"admin login failed ({_r.status_code}): {_r.text}"
+H: dict = {}  # auth travels in the cookie jar, no headers needed
 
 
 def wait_job(job_id: str, timeout: float = 10) -> dict:
@@ -34,7 +51,7 @@ def event():
     ev = c.post("/api/admin/events", json={"name": "E2E", "venue": "Stage"}, headers=H).json()
     days = [c.post(f"/api/admin/events/{ev['id']}/days", json={"event_date": d}, headers=H).json()
             for d in ("2027-04-03", "2027-04-04")]
-    slots = c.get(f"/api/events/{ev['id']}/slots").json()
+    slots = anon.get(f"/api/events/{ev['id']}/slots").json()
     return {"id": ev["id"], "days": days, "slots": slots}
 
 
@@ -44,15 +61,35 @@ def sid(event, day_idx, hhmm):
 
 
 def make_request(event, name, acts):
-    r = c.post("/api/requests", json={
+    r = anon.post("/api/requests", json={
         "event_id": event["id"], "group_name": name, "contact_name": "Contact",
         "email": f"{name.replace(' ', '').lower()}@example.org", "acts": acts})
     assert r.status_code == 201, r.text
     return r.json()
 
 
-def test_admin_requires_token():
-    assert c.get("/api/admin/requests").status_code == 401
+def test_admin_requires_login():
+    assert anon.get("/api/admin/requests").status_code == 401
+    with client_with("not-a-session") as fake:
+        assert fake.get("/api/admin/requests").status_code == 401
+
+
+def test_login_logout():
+    with httpx.Client(base_url=API, timeout=10) as b:
+        assert login(b, password="wrong-password").status_code == 401
+        assert login(b, email="nobody@example.org").status_code == 401
+        assert COOKIE not in b.cookies
+        r = login(b, email=f"  {EMAIL.upper()} ")            # email is case/space insensitive
+        assert r.status_code == 200 and "token" not in r.json()  # token only in the cookie
+        set_cookie = r.headers["set-cookie"].lower()
+        assert "httponly" in set_cookie and "samesite=lax" in set_cookie
+        token = b.cookies[COOKIE]
+        assert b.get("/api/auth/me").json()["email"] == EMAIL.lower()
+        assert b.post("/api/auth/logout").status_code == 204
+        assert COOKIE not in b.cookies                           # cookie expired by the server
+        # the old token no longer works even if replayed
+        with client_with(token) as replay:
+            assert replay.get("/api/admin/requests").status_code == 401
 
 
 def test_event_structure(event):
@@ -79,7 +116,7 @@ def test_suggest_assign_conflict_unassign(event):
     assert not job["result"]["unplaced"]
 
     # apply the suggestion
-    body = {"request_id": a["request_id"], "requested_by": "test",
+    body = {"request_id": a["request_id"],
             "assignments": [{"act_id": p["act_id"], "slot_ids": p["slot_ids"]} for p in props.values()]}
     job = wait_job(c.post(f"/api/admin/requests/{a['request_id']}/assign", json=body, headers=H).json()["job_id"])
     assert job["status"] == "done", job

@@ -9,6 +9,7 @@ services:
       - pgdata:/var/lib/postgresql/data
       - ./db/001_schema.sql:/docker-entrypoint-initdb.d/001_schema.sql:ro
       - ./db/002_jobs.sql:/docker-entrypoint-initdb.d/002_jobs.sql:ro
+      - ./db/003_auth.sql:/docker-entrypoint-initdb.d/003_auth.sql:ro
     ports: ["5432:5432"]
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U slotcrm"]
@@ -32,7 +33,11 @@ services:
     environment:
       DATABASE_URL: postgresql://slotcrm:slotcrm@postgres:5432/slotcrm
       REDIS_URL: redis://redis:6379
-      ADMIN_TOKEN: ${ADMIN_TOKEN:-dev-admin-token}
+      # first admin login, created only while no admin exists (see README > Admin logins)
+      ADMIN_EMAIL: ${ADMIN_EMAIL:-admin@example.org}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-change-me-now}
+      SESSION_HOURS: ${SESSION_HOURS:-12}
+      COOKIE_SECURE: ${COOKIE_SECURE:-false}   # set true when served over HTTPS
     depends_on:
       postgres: {condition: service_healthy}
       redis: {condition: service_healthy}
@@ -57,9 +62,6 @@ services:
     build: ./web
     environment:
       API_URL: http://api:8000
-      ADMIN_TOKEN: ${ADMIN_TOKEN:-dev-admin-token}
-      ADMIN_USER: ${ADMIN_USER:-admin}
-      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-change-me}
     depends_on: [api]
     ports: ["3000:3000"]
 

@@ -1,8 +1,11 @@
 'use client';
 import { useCallback, useEffect, useMemo, useState } from 'react';
+import { Icon } from '@/components/Icons';
+import { Fill, Skeleton } from '@/components/motion';
 import SlotGrid, { GridSlot } from '@/components/SlotGrid';
+import { useToast } from '@/components/Toasts';
 import {
-  addMinutes, api, Day, EventDetail, EventSummary, fmtDay, hhmm, Job, patch, pollJob, post,
+  addMinutes, api, Day, EventDetail, EventSummary, hhmm, Job, patch, plural, pollJob, post, statusLabel,
 } from '@/lib/api';
 
 type ReqRow = {
@@ -28,25 +31,31 @@ type Proposal = {
 };
 type Suggestion = { proposals: Proposal[]; unplaced: { act_id: number; act_name: string }[] };
 
+const FILTERS = ['', 'submitted', 'under_review', 'assigned', 'declined'] as const;
+const initials = (name: string) => name.split(/\s+/).filter(Boolean).slice(0, 2).map((w) => w[0]).join('').toUpperCase();
+
 export default function AdminPage() {
+  const toast = useToast();
   const [events, setEvents] = useState<EventSummary[]>([]);
   const [eventId, setEventId] = useState<number | null>(null);
   const [event, setEvent] = useState<EventDetail | null>(null);
-  const [requests, setRequests] = useState<ReqRow[]>([]);
+  const [requests, setRequests] = useState<ReqRow[] | null>(null);
   const [grid, setGrid] = useState<GridRow[]>([]);
   const [selectedId, setSelectedId] = useState<number | null>(null);
   const [detail, setDetail] = useState<ReqDetail | null>(null);
   const [activeAct, setActiveAct] = useState<number | null>(null);
   const [selection, setSelection] = useState<number[]>([]);
   const [suggestion, setSuggestion] = useState<Suggestion | null>(null);
-  const [msg, setMsg] = useState<{ kind: 'ok' | 'err' | 'info'; text: string } | null>(null);
   const [busy, setBusy] = useState(false);
-  const [filter, setFilter] = useState('');
+  const [filter, setFilter] = useState<string>('');
+  const [query, setQuery] = useState('');
+  const [loadedEvents, setLoadedEvents] = useState(false);
 
   useEffect(() => {
     api<EventSummary[]>('/api/events').then((e) => { setEvents(e); if (e.length) setEventId(e[0].id); })
-      .catch((e) => setMsg({ kind: 'err', text: e.message }));
-  }, []);
+      .catch((e) => toast.push({ kind: 'err', title: 'Could not load events', body: e.message }))
+      .finally(() => setLoadedEvents(true));
+  }, [toast]);
 
   const reload = useCallback(async (reqId: number | null = selectedId) => {
     if (!eventId) return;
@@ -60,22 +69,27 @@ export default function AdminPage() {
     if (reqId) setDetail(await api<ReqDetail>(`/api/admin/requests/${reqId}`));
   }, [eventId, selectedId]);
 
-  useEffect(() => { reload().catch((e) => setMsg({ kind: 'err', text: e.message })); }, [reload]);
+  useEffect(() => {
+    reload().catch((e) => toast.push({ kind: 'err', title: 'Could not load requests', body: e.message }));
+  }, [reload, toast]);
 
   function pick(id: number) {
-    setSelectedId(id); setActiveAct(null); setSelection([]); setSuggestion(null); setMsg(null);
+    setSelectedId(id); setActiveAct(null); setSelection([]); setSuggestion(null);
   }
 
-  async function run(label: string, fn: () => Promise<Job | void>) {
-    setBusy(true); setMsg({ kind: 'info', text: `${label}…` });
+  /** Runs an action with a progress notification that turns into success or failure. */
+  async function run(pending: string, done: string, fn: () => Promise<Job | void>) {
+    setBusy(true);
+    const id = toast.push({ kind: 'progress', title: pending });
     try {
       const job = await fn();
-      if (job && job.status === 'failed') setMsg({ kind: 'err', text: job.error ?? 'Job failed' });
-      else setMsg({ kind: 'ok', text: `${label}: done` });
+      if (job && job.status === 'failed') toast.update(id, { kind: 'err', title: 'Not applied', body: job.error ?? 'The job failed' });
+      else toast.update(id, { kind: 'ok', title: done });
       await reload();
       return job;
-    } catch (e) { setMsg({ kind: 'err', text: (e as Error).message }); }
-    finally { setBusy(false); }
+    } catch (e) {
+      toast.update(id, { kind: 'err', title: 'Something went wrong', body: (e as Error).message });
+    } finally { setBusy(false); }
   }
 
   const queue = async (path: string, body: unknown) => {
@@ -102,185 +116,294 @@ export default function AdminPage() {
         && (s.act_id === null || s.act_id === act.id));
     if (!ok) {
       setSelection([]);
-      setMsg({ kind: 'err', text: `Need ${act.segments_requested} free back-to-back segments starting here.` });
+      toast.push({
+        kind: 'err', title: `Needs ${plural(act.segments_requested, 'free segment')} in a row`,
+        body: 'Start on a time that has enough free back-to-back segments after it, within one band run.',
+      });
       return;
     }
-    setMsg(null);
     setSelection(win.map((s) => s.slot_id));
   }
 
   const slotMinutes = events.find((e) => e.id === eventId)?.slot_minutes ?? 10;
   const dayOf = (id: number): Day | undefined => event?.days.find((d) => d.id === id);
   function describe(slots: ActSlot[]) {
-    if (!slots.length) return 'not assigned';
+    if (!slots.length) return null;
     const first = slots[0], last = slots[slots.length - 1];
     const d = dayOf(first.day_id);
-    return `${d ? d.label : ''} ${hhmm(first.start_time)}–${addMinutes(last.start_time, slotMinutes)} (${first.band})`;
+    return `${d ? d.label : ''} ${hhmm(first.start_time)}–${addMinutes(last.start_time, slotMinutes)} · ${first.band}`;
   }
 
-  const shown = requests.filter((r) => !filter || r.status === filter);
+  const counts = useMemo(() => {
+    const c: Record<string, number> = { '': requests?.length ?? 0 };
+    for (const r of requests ?? []) c[r.status] = (c[r.status] ?? 0) + 1;
+    return c;
+  }, [requests]);
+  const q = query.trim().toLowerCase();
+  const shown = (requests ?? []).filter((r) => (!filter || r.status === filter)
+    && (!q || r.group_name.toLowerCase().includes(q) || r.email.toLowerCase().includes(q)));
 
-  if (!eventId) return <div className="card">No event yet. Create one under Event settings. {msg?.text}</div>;
+  if (loadedEvents && !eventId) {
+    return (
+      <div className="card"><div className="empty">
+        <span className="empty-icon"><Icon name="stage" /></span>
+        <strong>No event yet</strong>
+        <span>Create one in <a href="/admin/settings">Event settings</a>, then add its days.</span>
+      </div></div>
+    );
+  }
 
   return (
-    <div>
-      <div className="row fit" style={{ marginBottom: 12 }}>
-        <h1 style={{ margin: 0 }}>Admin</h1>
-        <select value={eventId} onChange={(e) => { setEventId(Number(e.target.value)); setSelectedId(null); setDetail(null); }}>
-          {events.map((e) => <option key={e.id} value={e.id}>{e.name}</option>)}
-        </select>
-        <select value={filter} onChange={(e) => setFilter(e.target.value)}>
-          <option value="">All requests</option>
-          {['submitted', 'under_review', 'assigned', 'declined', 'cancelled'].map((s) => <option key={s}>{s}</option>)}
-        </select>
-      </div>
-      {msg && <div className={`banner ${msg.kind}`}>{msg.text}</div>}
-
-      <div className="two">
-        <div>
-          <h3>Requests ({shown.length})</h3>
-          {shown.map((r) => (
-            <div key={r.id} className={`list-item ${r.id === selectedId ? 'sel' : ''}`} onClick={() => pick(r.id)}>
-              <strong>{r.group_name}</strong>
-              <div className="row fit" style={{ gap: 6, marginTop: 4 }}>
-                <span className={`badge ${r.status}`}>{r.status}</span>
-                <span className={`badge ${r.payment_status}`}>{r.payment_status}</span>
-                <span className="muted">{r.segments_assigned}/{r.segments_requested} seg · {r.acts} acts</span>
-              </div>
-            </div>
-          ))}
-          {!shown.length && <p className="muted">No requests yet.</p>}
+    <>
+      <div className="page-head">
+        <div className="grow">
+          <h1>Admin</h1>
+          <p className="sub">Review requests and place each act on the stage timetable.</p>
         </div>
+        <div className="actions">
+          <label className="sr-only" htmlFor="event-pick">Event</label>
+          <select id="event-pick" className="inline" value={eventId ?? ''}
+                  onChange={(e) => { setEventId(Number(e.target.value)); setSelectedId(null); setDetail(null); }}>
+            {events.map((e) => <option key={e.id} value={e.id}>{e.name}</option>)}
+          </select>
+        </div>
+      </div>
 
-        <div>
+      <div className="workbench">
+        <section className="card queue" aria-labelledby="req-h">
+          <div className="card-head">
+            <h2 id="req-h">Requests</h2>
+            <span className="badge plain num">{shown.length}</span>
+          </div>
+          <div className="queue-tools">
+            <div className="input-icon">
+              <Icon name="search" size={16} />
+              <label className="sr-only" htmlFor="req-search">Search requests</label>
+              <input id="req-search" type="search" placeholder="Search group or email" value={query}
+                     onChange={(e) => setQuery(e.target.value)} />
+            </div>
+            <div className="segmented" role="group" aria-label="Filter by status">
+              {FILTERS.map((f) => (
+                <button key={f || 'all'} type="button" aria-pressed={filter === f} onClick={() => setFilter(f)}>
+                  {f ? statusLabel(f) : 'All'} <span className="count">{counts[f] ?? 0}</span>
+                </button>
+              ))}
+            </div>
+          </div>
+          {requests === null ? (
+            <div style={{ padding: 'var(--s4)', display: 'grid', gap: 12 }}>
+              {[0, 1, 2, 3].map((k) => <Skeleton key={k} h={44} />)}
+            </div>
+          ) : shown.length ? (
+            <ul className="req-list">
+              {shown.map((r, i) => (
+                <li key={r.id} style={{ animationDelay: `${Math.min(i, 10) * 25}ms` }}>
+                  <button type="button" className="list-item" aria-current={r.id === selectedId ? 'true' : undefined}
+                          onClick={() => pick(r.id)}>
+                    <span className="avatar" aria-hidden="true">{initials(r.group_name)}</span>
+                    <span className="title">{r.group_name}</span>
+                    <span className="meta">
+                      <span className={`badge ${r.status}`}>{statusLabel(r.status)}</span>
+                      <span className="num">{r.segments_assigned}/{r.segments_requested} seg</span>
+                      <span>· {plural(r.acts, 'act')}</span>
+                      {r.payment_status === 'pending' && <span title="Payment pending"><i className="dot pending" /></span>}
+                    </span>
+                  </button>
+                </li>
+              ))}
+            </ul>
+          ) : (
+            <div className="empty">
+              <span className="empty-icon"><Icon name="search" /></span>
+              <strong>No matches</strong>
+              <span>{requests.length ? 'Try another search or filter.' : <>No requests yet. Groups send them from the <a href="/">request form</a>.</>}</span>
+            </div>
+          )}
+        </section>
+
+        <div style={{ minWidth: 0 }}>
           {detail ? (
-            <div className="card">
-              <div className="row">
-                <div>
-                  <h2 style={{ margin: 0 }}>{detail.group_name}</h2>
-                  <div className="muted">{detail.contact_name} · {detail.email}{detail.phone ? ` · ${detail.phone}` : ''}</div>
-                  {detail.group_notes && <div>“{detail.group_notes}”</div>}
+            <section className="card" aria-labelledby="detail-h" key={detail.id} style={{ animation: 'rise 220ms var(--ease-out) both' }}>
+              <div className="detail-head">
+                <div className="who">
+                  <span className="avatar light" aria-hidden="true">{initials(detail.group_name)}</span>
+                  <div style={{ minWidth: 0 }}>
+                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: 10, alignItems: 'center' }}>
+                      <h2 id="detail-h">{detail.group_name}</h2>
+                      <span className={`badge ${detail.status}`}>{statusLabel(detail.status)}</span>
+                    </div>
+                    <div className="contact">
+                      {detail.contact_name} · <a href={`mailto:${detail.email}`}>{detail.email}</a>
+                      {detail.phone ? <> · <a href={`tel:${detail.phone}`}>{detail.phone}</a></> : null}
+                    </div>
+                  </div>
                 </div>
-                <div className="row fit" style={{ justifyContent: 'flex-end' }}>
-                  <span className={`badge ${detail.status}`}>{detail.status}</span>
-                  <button disabled={busy} onClick={() => run('Payment updated', async () => {
-                    await patch(`/api/admin/requests/${detail.id}`,
-                      { payment_status: detail.payment_status === 'paid' ? 'pending' : 'paid' });
-                  })}>
-                    <span className={`dot ${detail.payment_status}`} />
-                    {detail.payment_status === 'paid' ? 'Paid' : 'Payment pending'} (toggle)
+                <div className="actions">
+                  <button type="button" className="switch" role="switch" aria-checked={detail.payment_status === 'paid'}
+                          disabled={busy} title="Payment is a reminder only; it never blocks assignment"
+                          onClick={() => run('Updating payment…', detail.payment_status === 'paid' ? 'Marked as pending' : 'Marked as paid', async () => {
+                            await patch(`/api/admin/requests/${detail.id}`,
+                              { payment_status: detail.payment_status === 'paid' ? 'pending' : 'paid' });
+                          })}>
+                    <span className="knob" aria-hidden="true" />Paid
                   </button>
                   <button className="danger" disabled={busy} onClick={() => {
                     if (confirm('Decline this request? Its segments are released and the group is emailed.'))
-                      run('Declined', async () => { await patch(`/api/admin/requests/${detail.id}`, { status: 'declined' }); });
+                      run('Declining…', 'Request declined', async () => { await patch(`/api/admin/requests/${detail.id}`, { status: 'declined' }); });
                   }}>Decline</button>
                 </div>
               </div>
 
-              <h3 style={{ marginTop: 14 }}>Acts</h3>
-              {detail.acts.map((a) => (
-                <div key={a.id} className={`act ${a.id === activeAct ? 'active' : ''}`}>
-                  <div className="row">
-                    <div>
-                      <strong>{a.name}</strong> · {a.segments_requested} segment{a.segments_requested > 1 ? 's' : ''}
-                      {a.notes && <span className="muted"> · {a.notes}</span>}
-                      <div className="muted">
-                        Wants: {a.preferred.length ? `${a.preferred.length} preferred segments` : 'no preference'} ·
-                        Assigned: {describe(a.assigned)}
+              {detail.group_notes && <p className="quote">“{detail.group_notes}”</p>}
+
+              <div className="acts">
+                {detail.acts.map((a) => {
+                  const when = describe(a.assigned);
+                  const placing = a.id === activeAct;
+                  return (
+                    <div key={a.id} className={`act ${placing ? 'active' : ''}`}>
+                      <div style={{ minWidth: 0 }}>
+                        <div className="act-title">
+                          {a.name}
+                          <span className="badge plain">{plural(a.segments_requested, 'segment')}</span>
+                          {when && <span className="badge assigned">{when}</span>}
+                        </div>
+                        <div className="act-sub">
+                          {a.preferred.length ? `Prefers ${plural(a.preferred.length, 'segment')}` : 'Any time is fine'}
+                          {a.notes && <> · {a.notes}</>}
+                        </div>
+                        <div className="act-progress">
+                          <span className="track"><Fill pct={(a.assigned.length / a.segments_requested) * 100} style={{ background: 'var(--ok)' }} /></span>
+                          <span className="num">{a.assigned.length}/{a.segments_requested}</span>
+                        </div>
+                        {placing && (
+                          <p className="placing-hint"><span className="pulse" />
+                            Click a start time on the timetable to select {plural(a.segments_requested, 'segment')} in a row.
+                          </p>
+                        )}
+                      </div>
+                      <div className="actions">
+                        <button aria-pressed={placing} className={placing ? '' : 'primary'}
+                                onClick={() => { setActiveAct(placing ? null : a.id); setSelection([]); }}>
+                          {placing ? 'Stop placing' : <><Icon name="schedule" size={16} />Place</>}
+                        </button>
+                        {a.assigned.length > 0 && (
+                          <button className="danger" disabled={busy} onClick={() => run('Releasing segments…', `Unassigned “${a.name}”`, () =>
+                            queue(`/api/admin/requests/${detail.id}/unassign`, { act_ids: [a.id] }))}>
+                            Unassign
+                          </button>
+                        )}
                       </div>
                     </div>
-                    <div className="row fit" style={{ justifyContent: 'flex-end' }}>
-                      <button onClick={() => { setActiveAct(a.id === activeAct ? null : a.id); setSelection([]); }}>
-                        {a.id === activeAct ? 'Stop placing' : 'Place on grid'}
-                      </button>
-                      {a.assigned.length > 0 && (
-                        <button className="danger" disabled={busy} onClick={() => run('Unassigned', () =>
-                          queue(`/api/admin/requests/${detail.id}/unassign`, { act_ids: [a.id], requested_by: 'admin' }))}>
-                          Unassign
-                        </button>
-                      )}
-                    </div>
-                  </div>
-                </div>
-              ))}
+                  );
+                })}
+              </div>
 
-              <div className="row fit" style={{ marginTop: 8 }}>
-                <button disabled={busy} onClick={async () => {
-                  const job = await run('Suggestion ready', () =>
-                    queue(`/api/admin/requests/${detail.id}/suggest`, { requested_by: 'admin' }));
-                  if (job && job.status === 'done') setSuggestion(job.result);
-                }}>Suggest allocation</button>
+              <div className="detail-foot">
                 {act && selection.length > 0 && (
-                  <button className="primary" disabled={busy} onClick={() =>
-                    run('Assigned', async () => {
+                  <button className="primary" disabled={busy} aria-busy={busy} onClick={() =>
+                    run('Assigning…', `Assigned “${act.name}”`, async () => {
                       const job = await queue(`/api/admin/requests/${detail.id}/assign`, {
-                        request_id: detail.id, requested_by: 'admin',
+                        request_id: detail.id,
                         assignments: [{ act_id: act.id, slot_ids: selection }],
                       });
-                      if (job.status === 'done') setSelection([]);
+                      if (job.status === 'done') { setSelection([]); setActiveAct(null); }
                       return job;
                     })}>
-                    Assign {selection.length} selected segment{selection.length > 1 ? 's' : ''} to “{act.name}”
+                    <Icon name="check" size={16} />Assign {plural(selection.length, 'segment')} to “{act.name}”
                   </button>
                 )}
+                <button disabled={busy} onClick={async () => {
+                  const job = await run('Finding the best times…', 'Suggestion ready', () =>
+                    queue(`/api/admin/requests/${detail.id}/suggest`, {}));
+                  if (job && job.status === 'done') setSuggestion(job.result);
+                }}><Icon name="spark" size={16} />Suggest allocation</button>
               </div>
 
               {suggestion && (
-                <div className="card" style={{ marginTop: 10, background: '#f8fafc' }}>
-                  <strong>Suggested allocation</strong> <span className="muted">(not applied until you confirm)</span>
-                  {suggestion.proposals.map((p) => (
-                    <div key={p.act_id}>
-                      {p.act_name}: {p.event_date} {hhmm(p.start_time)}–{hhmm(p.end_time)}
-                      {p.matches_preferences === false &&
-                        <span className="badge pending" style={{ marginLeft: 6 }}>
-                          only {p.preference_overlap}/{p.segments_requested} in preferred times</span>}
-                    </div>
-                  ))}
-                  {suggestion.unplaced.map((u) => (
-                    <div key={u.act_id} style={{ color: '#b91c1c' }}>{u.act_name}: no free back-to-back window</div>
-                  ))}
-                  <div className="row fit" style={{ marginTop: 8 }}>
+                <div className="suggestion" role="region" aria-label="Suggested allocation">
+                  <div className="suggestion-head"><Icon name="spark" size={16} />Suggested allocation
+                    <span className="muted" style={{ fontWeight: 400 }}>· not applied until you confirm</span></div>
+                  <ul>
+                    {suggestion.proposals.map((p) => (
+                      <li key={p.act_id}>
+                        <strong>{p.act_name}</strong>
+                        <span className="num muted">{p.event_date} · {hhmm(p.start_time)}–{hhmm(p.end_time)}</span>
+                        {p.matches_preferences === true && <span className="badge assigned">matches preference</span>}
+                        {p.matches_preferences === false &&
+                          <span className="badge pending">{p.preference_overlap}/{p.segments_requested} in preferred times</span>}
+                      </li>
+                    ))}
+                    {suggestion.unplaced.map((u) => (
+                      <li key={u.act_id} className="unplaced"><Icon name="alert" size={14} />{u.act_name}: no free back-to-back window</li>
+                    ))}
+                  </ul>
+                  <div className="actions">
                     <button className="primary" disabled={busy || !suggestion.proposals.length} onClick={() =>
-                      run('Suggestion applied', async () => {
+                      run('Applying suggestion…', 'Suggestion applied', async () => {
                         const job = await queue(`/api/admin/requests/${detail.id}/assign`, {
-                          request_id: detail.id, requested_by: 'admin',
+                          request_id: detail.id,
                           assignments: suggestion.proposals.map((p) => ({ act_id: p.act_id, slot_ids: p.slot_ids })),
                         });
                         if (job.status === 'done') setSuggestion(null);
                         return job;
-                      })}>Apply suggestion</button>
-                    <button onClick={() => setSuggestion(null)}>Discard</button>
+                      })}><Icon name="check" size={16} />Apply suggestion</button>
+                    <button className="ghost" onClick={() => setSuggestion(null)}>Discard</button>
                   </div>
                 </div>
               )}
-            </div>
-          ) : <div className="card muted">Select a request to review and assign its acts.</div>}
-
-          <h3>Stage schedule</h3>
-          <p className="legend muted">
-            <span>Grey = taken</span><span>Yellow = this act</span><span>Dashed = group’s preference</span>
-            <span>Blue = selected</span>
-            <span><i className="dot pending" />payment pending</span><span><i className="dot paid" />paid</span>
-          </p>
-          {event && (
-            <SlotGrid slots={grid} days={event.days} cell={(s) => {
-              const r = grid.find((g) => g.slot_id === s.id)!;
-              const mine = act && r.act_id === act.id;
-              const taken = r.act_id !== null && !mine;
-              const sel = selection.includes(s.id);
-              return {
-                className: [taken ? 'cell-taken' : '', mine ? 'cell-mine' : '', sel ? 'cell-selected' : '',
-                  !taken && prefIds.has(s.id) ? 'cell-pref' : ''].join(' '),
-                disabled: taken || !act,
-                onClick: () => clickCell(r),
-                title: taken ? `${r.group_name} · ${r.act_name}` : `${hhmm(s.start_time)}–${hhmm(s.end_time)}`,
-                content: r.act_id !== null
-                  ? <><i className={`dot ${r.payment_status}`} />{r.group_name} · {r.act_name}</> : null,
-              };
-            }} />
+            </section>
+          ) : (
+            <div className="card"><div className="empty">
+              <span className="empty-icon"><Icon name="user" /></span>
+              <strong>Select a request</strong>
+              <span>Pick a group from the list to review its acts and place them on the timetable.</span>
+            </div></div>
           )}
+
+          <section className="card" aria-labelledby="grid-h">
+            <div className="card-head">
+              <div>
+                <h2 id="grid-h">Stage timetable</h2>
+                <p>{act ? <>Placing <strong style={{ color: 'var(--ink)' }}>“{act.name}”</strong>: choose a start time</> : 'Choose “Place” on an act to start assigning'}</p>
+              </div>
+              <div className="legend">
+                <span><i className="swatch taken" />Booked</span>
+                <span><i className="swatch mine" />This act</span>
+                <span><i className="swatch pref" />Preferred</span>
+                <span><i className="swatch selected" />Selected</span>
+                <span><i className="dot pending" />Unpaid</span>
+              </div>
+            </div>
+            {event ? (
+              <SlotGrid slots={grid} days={event.days} cell={(s) => {
+                const r = grid.find((g) => g.slot_id === s.id)!;
+                const mine = act && r.act_id === act.id;
+                const taken = r.act_id !== null && !mine;
+                const sel = selection.includes(s.id);
+                return {
+                  className: [taken ? 'cell-taken' : '', sel ? 'cell-selected' : '',
+                    !taken && !sel && prefIds.has(s.id) ? 'cell-pref' : ''].join(' '),
+                  disabled: taken || !act,
+                  pressed: sel,
+                  mergeKey: taken || (mine && !sel) ? `act-${r.act_id}` : undefined,
+                  tone: mine ? 'mine' : 'booked',
+                  onClick: () => clickCell(r),
+                  title: taken ? `${r.group_name} · ${r.act_name}` : `${hhmm(s.start_time)}–${hhmm(s.end_time)}`,
+                  content: r.act_id !== null
+                    ? <><i className={`dot ${r.payment_status}`} />{r.group_name} · {r.act_name}</>
+                    : sel ? 'Selected' : null,
+                };
+              }} />
+            ) : (
+              <div className="card-body" style={{ display: 'grid', gap: 8 }}>
+                {Array.from({ length: 8 }, (_, k) => <Skeleton key={k} h={22} />)}
+              </div>
+            )}
+          </section>
         </div>
       </div>
-    </div>
+    </>
   );
 }
+

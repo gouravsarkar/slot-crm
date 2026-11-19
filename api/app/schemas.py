@@ -34,16 +34,14 @@ class AssignmentIn(BaseModel):
 class AssignJobIn(BaseModel):
     request_id: int
     assignments: list[AssignmentIn] = Field(min_length=1)
-    requested_by: str = "admin"
 
 
 class UnassignJobIn(BaseModel):
     act_ids: list[int] = Field(min_length=1)
-    requested_by: str = "admin"
 
 
 class SuggestJobIn(BaseModel):
-    requested_by: str = "admin"
+    pass  # empty body; who asked comes from the login session
 
 
 class EventIn(BaseModel):

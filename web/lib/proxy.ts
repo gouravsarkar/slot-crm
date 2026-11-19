@@ -1,12 +1,13 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { API_URL, sessionCookieHeader } from './session';
 
-const API_URL = process.env.API_URL ?? 'http://localhost:8000';
-
-/** Forwards a request to FastAPI. Admin calls get the secret token added server-side. */
+/** Forwards a request to FastAPI. Admin calls pass the session cookie through; public calls send no cookies. */
 export async function proxy(req: NextRequest, path: string[], admin: boolean) {
   const url = `${API_URL}/api/${admin ? 'admin/' : ''}${path.join('/')}${req.nextUrl.search}`;
   const headers = new Headers({ 'content-type': req.headers.get('content-type') ?? 'application/json' });
-  if (admin) headers.set('x-admin-token', process.env.ADMIN_TOKEN ?? '');
+  if (admin) {
+    for (const [k, v] of Object.entries(sessionCookieHeader(req))) headers.set(k, v);
+  }
   const hasBody = !['GET', 'HEAD', 'DELETE'].includes(req.method);
   const res = await fetch(url, {
     method: req.method,

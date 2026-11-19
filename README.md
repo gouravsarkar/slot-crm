@@ -15,6 +15,9 @@ Performance-slot booking for a single-stage, two-day event. Groups submit reques
 
 | URL | Who | What |
 |---|---|---|
+| `/portal` | Participants (public, no login) | Participant portal: **Book a slot for your program** or **Check your program's slot** |
+| `/portal/book` | Participants | Same request form, phone number mandatory; saved to the same tables, so it appears on the Admin page |
+| `/portal/check` | Participants | Enter email + phone number to see every booking made with them: status, payment and confirmed times |
 | `/` | Groups (public) | Request form: acts and preferred segments |
 | `/admin/report` | Admin | **Home**: view-only live slot report with the colour-coded stage schedule, summary figures, per-day schedule, requests still waiting, **Export PDF** |
 | `/admin` | Admin | Review requests and assign segments |
@@ -34,7 +37,7 @@ docker compose up --build
 Then open:
 
 - Request form: http://localhost:3000
-- Admin: http://localhost:3000/admin (login `admin` / `change-me`)
+- Admin: http://localhost:3000/admin (log in with `admin@example.org` / `change-me-now`)
 - Event settings (create event, set dates): http://localhost:3000/admin/settings
 - API docs: http://localhost:8000/docs
 - Caught emails (dev): http://localhost:8025
@@ -43,10 +46,10 @@ First-time setup: go to **Admin > Event settings**, create an event, then add it
 Saturday and Sunday dates. Segments are generated automatically.
 (Optional demo data: `docker compose exec -T postgres psql -U slotcrm -d slotcrm < db/seed_demo.sql`)
 
-Change the default credentials before real use:
+Change the default login before real use (see [Admin logins](#admin-logins)):
 
 ```bash
-ADMIN_TOKEN=some-long-secret ADMIN_USER=you ADMIN_PASSWORD=a-strong-password docker compose up --build
+docker compose exec api python -m app.manage_users set-password admin@example.org
 ```
 
 Stop with `Ctrl+C`; remove data with `docker compose down -v`.
@@ -60,7 +63,7 @@ Requirements: PostgreSQL 16, Redis 7, Python 3.11+, Node 20+.
 createdb slotcrm   # or: psql -c "CREATE DATABASE slotcrm"
 # the app defaults to postgresql://slotcrm:slotcrm@localhost:5432/slotcrm
 # (create that role, or set DATABASE_URL to your own)
-psql "$DATABASE_URL" -f db/001_schema.sql -f db/002_jobs.sql
+psql "$DATABASE_URL" -f db/001_schema.sql -f db/002_jobs.sql -f db/003_auth.sql
 
 # 2. Redis (default redis://localhost:6379)
 redis-server
@@ -69,7 +72,7 @@ redis-server
 cd api
 python -m venv .venv && source .venv/bin/activate      # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
-uvicorn app.main:app --port 8000
+ADMIN_EMAIL=you@example.org ADMIN_PASSWORD=a-strong-password uvicorn app.main:app --port 8000
 
 # 4. Worker (terminal 2)
 cd worker
@@ -88,10 +91,43 @@ Environment variables (all have local defaults):
 |---|---|---|
 | `DATABASE_URL` | api, worker | `postgresql://slotcrm:slotcrm@localhost:5432/slotcrm` |
 | `REDIS_URL` | api, worker | `redis://localhost:6379` |
-| `ADMIN_TOKEN` | api, web | `dev-admin-token` (must match in both) |
-| `ADMIN_USER` / `ADMIN_PASSWORD` | web | `admin` / `change-me` |
+| `ADMIN_EMAIL` / `ADMIN_PASSWORD` | api | first admin, created only while none exists (Docker: `admin@example.org` / `change-me-now`) |
+| `SESSION_HOURS` | api | `12` (how long a login lasts) |
+| `COOKIE_SECURE` | api | `false` (set `true` behind HTTPS) |
 | `API_URL` | web | `http://localhost:8000` |
 | `SMTP_HOST` / `SMTP_PORT` / `SMTP_USER` / `SMTP_PASSWORD` / `MAIL_FROM` | worker | unset host = emails are logged, not sent; Docker defaults to Mailpit |
+
+## Admin logins
+
+Admins log in at `/login` with their **email and password**. Everything is stored in the
+existing Postgres database (`db/003_auth.sql`):
+
+- `admin_users`: email (lower-case, unique) and a **bcrypt** hash of the password (cost 12).
+- `admin_sessions`: one row per logged-in browser, holding only a SHA-256 of the session
+  token. Sessions expire after `SESSION_HOURS`.
+- **Cookies:** on login FastAPI sets an httpOnly, SameSite=Lax cookie `slotcrm_session`
+  (Secure when `COOKIE_SECURE=true`). The token is never in a response body or readable by
+  page JavaScript. FastAPI reads the cookie on every admin call; Next.js only passes it
+  through. Logging out deletes the session row and expires the cookie.
+- After 5 wrong passwords in a row an account is locked for 15 minutes.
+- Jobs and assignments record the email of the admin who made them.
+
+The first account comes from `ADMIN_EMAIL` / `ADMIN_PASSWORD` when the API starts and no
+admin exists yet. Manage accounts from the command line:
+
+```bash
+docker compose exec api python -m app.manage_users create   someone@example.org
+docker compose exec api python -m app.manage_users set-password someone@example.org  # logs them out everywhere
+docker compose exec api python -m app.manage_users disable  someone@example.org
+docker compose exec api python -m app.manage_users list
+```
+
+**Upgrading an existing database** (Postgres only runs the `db/` files on a brand-new volume):
+
+```bash
+docker compose exec -T postgres psql -U slotcrm -d slotcrm < db/003_auth.sql
+docker compose up -d --build api web
+```
 
 ## Sending real email
 
@@ -126,7 +162,7 @@ with the same `SMTP_*` variables.
 With the API, worker, Postgres and Redis running:
 
 ```bash
-API_URL=http://localhost:8000 ADMIN_TOKEN=dev-admin-token pytest -q api/tests
+API_URL=http://localhost:8000 ADMIN_EMAIL=admin@example.org ADMIN_PASSWORD=change-me-now pytest -q api/tests
 cd worker && npm test
 ```
 

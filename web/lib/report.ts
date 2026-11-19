@@ -120,4 +120,4 @@ export function buildReport(event: EventDetail, grid: GridRow[], requests: Reque
 export const fmtStamp = (iso: string) =>
   new Date(iso).toLocaleString('en-GB', { dateStyle: 'medium', timeStyle: 'short' });
 
-export const statusLabel = (s: string) => s.replace('_', ' ');
+export { statusLabel } from './api';
